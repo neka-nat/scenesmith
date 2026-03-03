@@ -15,9 +15,9 @@ This script post-processes Physics.usda files to fix three object categories:
    MassAPI from base_link to wrapper, removing inner RigidBodyAPI, and
    deleting the internal FixedJoint.
 
-3. **Articulated objects** (wardrobes with doors, fridges): Move
-   ArticulationRootAPI from wrapper to E_body, set kinematic mode on E_body,
-   remove wrapper physics, and delete FixedJoints to root.
+3. **Articulated objects** (wardrobes with doors, fridges): Reparent nested
+   rigid bodies as siblings, add self-collision filters (mirroring MuJoCo's
+   ``<contact><exclude>`` pairs), and set up correct articulation structure.
 
 Usage:
     # Fix single scene USD directory.
@@ -37,9 +37,6 @@ from pathlib import Path
 from pxr import Sdf, Usd, UsdPhysics
 
 console_logger = logging.getLogger(__name__)
-
-
-# --- Helper functions ---
 
 
 def remove_rigid_body_api(prim: Usd.Prim) -> bool:
@@ -113,7 +110,136 @@ def delete_prims(stage: Usd.Stage, paths: list[Sdf.Path]) -> int:
     return count
 
 
-# --- Classification ---
+def _reparent_nested_rigid_bodies(
+    stage: Usd.Stage,
+    wrapper_prim: Usd.Prim,
+    all_layers: list[Sdf.Layer],
+) -> None:
+    """Move nested rigid bodies to be direct children of wrapper.
+
+    The MuJoCo→USD converter creates a hierarchy like:
+        wrapper/E_body/E_door  (door is child of body)
+    But PhysX requires articulation links to be siblings:
+        wrapper/E_body
+        wrapper/E_door
+
+    We reparent across ALL sublayers (Physics, Geometry, Materials) so
+    that mesh data, materials, and physics all move together. Joint
+    relationship targets are updated in the stage's edit target layer.
+    """
+    wrapper_path = wrapper_prim.GetPath()
+
+    # Find the root body (first direct child with RigidBodyAPI).
+    root_body = None
+    for child in wrapper_prim.GetChildren():
+        if child.HasAPI(UsdPhysics.RigidBodyAPI):
+            root_body = child
+            break
+    if root_body is None:
+        return
+
+    # Collect child rigid bodies that need reparenting.
+    prims_to_move = []
+    for child in root_body.GetChildren():
+        if child.HasAPI(UsdPhysics.RigidBodyAPI):
+            prims_to_move.append(child.GetPath())
+
+    if not prims_to_move:
+        return
+
+    # Build path mapping.
+    path_mapping: dict[str, str] = {}
+    for old_path in prims_to_move:
+        new_path = wrapper_path.AppendChild(old_path.name)
+        path_mapping[str(old_path)] = str(new_path)
+
+    # Apply reparenting to EVERY layer that contains these prims.
+    for layer in all_layers:
+        edit = Sdf.BatchNamespaceEdit()
+        has_edits = False
+        for old_path in prims_to_move:
+            if layer.GetPrimAtPath(old_path):
+                new_path = wrapper_path.AppendChild(old_path.name)
+                edit.Add(old_path, new_path)
+                has_edits = True
+        if has_edits:
+            if not layer.Apply(edit):
+                console_logger.warning(
+                    f"Failed to reparent in layer {layer.identifier}"
+                )
+
+    # Update all relationship targets that referenced the old paths.
+    # This covers joint body0/body1 targets.
+    for descendant in Usd.PrimRange(wrapper_prim):
+        for rel in descendant.GetRelationships():
+            targets = rel.GetTargets()
+            new_targets = []
+            changed = False
+            for target in targets:
+                target_str = str(target)
+                for old_str, new_str in path_mapping.items():
+                    if target_str == old_str or target_str.startswith(old_str + "/"):
+                        target_str = new_str + target_str[len(old_str) :]
+                        changed = True
+                        break
+                new_targets.append(Sdf.Path(target_str))
+            if changed:
+                rel.SetTargets(new_targets)
+
+
+def _add_self_collision_filter(
+    stage: Usd.Stage,
+    wrapper_prim: Usd.Prim,
+) -> None:
+    """Add self-collision filtering for all rigid bodies in an articulated object.
+
+    The MuJoCo source has ``<contact><exclude>`` pairs that prevent adjacent
+    articulated links from colliding (e.g. wardrobe body vs. its doors).
+    The mujoco_usd_converter does not convert these (``Tf.Warn("excludes
+    are not supported")``), so we recreate them using a PhysicsCollisionGroup
+    that includes all rigid bodies within the object and filters against
+    itself.
+
+    Without this, PhysX detects collisions between overlapping bodies at
+    hinge points, which prevents joints from moving interactively.
+    """
+    # Collect all rigid body prims under the wrapper.
+    rigid_bodies = []
+    for descendant in Usd.PrimRange(wrapper_prim):
+        if descendant.HasAPI(UsdPhysics.RigidBodyAPI):
+            rigid_bodies.append(descendant.GetPath())
+
+    if len(rigid_bodies) < 2:
+        return  # No self-collision possible with fewer than 2 bodies.
+
+    # Create a PhysicsCollisionGroup under the wrapper.
+    group_path = wrapper_prim.GetPath().AppendChild("selfCollisionFilter")
+    group = UsdPhysics.CollisionGroup.Define(stage, group_path)
+
+    # Add all rigid bodies to the group via CollectionAPI.
+    collection = group.GetCollidersCollectionAPI()
+    includes_rel = collection.CreateIncludesRel()
+    for body_path in rigid_bodies:
+        includes_rel.AddTarget(body_path)
+
+    # Filter the group against itself → disables collision between members.
+    filtered_rel = group.GetFilteredGroupsRel()
+    filtered_rel.AddTarget(group_path)
+
+    console_logger.debug(
+        f"  {wrapper_prim.GetPath().name}: self-collision filter for "
+        f"{len(rigid_bodies)} bodies"
+    )
+
+
+def _has_nested_rigid_bodies(wrapper_prim: Usd.Prim) -> bool:
+    """Check if any child rigid body has a child that is also a rigid body."""
+    for child in wrapper_prim.GetChildren():
+        if child.HasAPI(UsdPhysics.RigidBodyAPI):
+            for grandchild in child.GetChildren():
+                if grandchild.HasAPI(UsdPhysics.RigidBodyAPI):
+                    return True
+    return False
 
 
 def classify_object(
@@ -125,19 +251,21 @@ def classify_object(
     Classification logic:
     1. Check ArticulationRootAPI first — articulated objects may not have
        FixedJoints to root (e.g. when furniture uses freejoints in MuJoCo).
-    2. Check if wrapper has a FixedJoint descendant with body0 targeting root.
-    3. If welded and no ArticulationRootAPI -> 'static'.
-    4. If not welded and no ArticulationRootAPI -> 'dynamic'.
+    2. Check for nested rigid bodies — this catches partially-fixed objects
+       from prior runs where ArticulationRootAPI was already removed but
+       bodies were not yet reparented as siblings.
+    3. Check if wrapper has a FixedJoint descendant with body0 targeting root.
+    4. If welded and no ArticulationRootAPI -> 'static'.
+    5. If not welded and no ArticulationRootAPI -> 'dynamic'.
     """
     if wrapper_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        return "articulated"
+    if _has_nested_rigid_bodies(wrapper_prim):
         return "articulated"
     welded_joints = find_fixed_joints_with_body0(wrapper_prim, root_path)
     if welded_joints:
         return "static"
     return "dynamic"
-
-
-# --- Fix functions ---
 
 
 def fix_static_object(
@@ -210,90 +338,91 @@ def fix_articulated_object(
     stage: Usd.Stage,
     wrapper_prim: Usd.Prim,
     root_path: Sdf.Path,
+    all_layers: list[Sdf.Layer],
 ) -> None:
-    """Fix an articulated object for Isaac Sim.
+    """Fix an articulated object for Isaac Sim / PhysX compatibility.
 
-    Moves ArticulationRootAPI from wrapper to E_body (immediate child),
-    sets kinematic mode on E_body, ensures E_body has RigidBodyAPI (joints
-    reference it as body0), removes wrapper physics, and deletes FixedJoints
-    to root and from E_body to wrapper.
+    The converter creates two types of articulated objects:
+
+    A) **Freejoint** (wardrobes, cabinets): No FixedJoint to scene root.
+       These should be free-floating — the whole object can be pushed
+       around. Fix: remove ArticulationRootAPI entirely and delete the
+       internal FixedJoint. Bodies become regular rigid bodies connected
+       by joints. This allows Isaac Sim's interactive force tools to
+       work on each body individually.
+
+    B) **Welded** (wall-mounted sconces, built-in cabinets): Has a
+       FixedJoint to scene root. These should be fixed-base articulations.
+       Fix: clear body0 on the FixedJoint from wrapper→E_body so it
+       anchors E_body to the world.
+
+    Common fixes for both:
+    - Remove RigidBodyAPI from the wrapper.
+    - Delete any FixedJoint from wrapper to the scene root (invalid
+      because the root Xform has no RigidBodyAPI).
+    - Move child rigid bodies (doors/drawers) from being nested under
+      E_body to being direct children of the wrapper (PhysX requires
+      sibling rigid bodies, not parent-child nesting).
     """
     wrapper_path = wrapper_prim.GetPath()
 
-    # Find E_body: immediate child that has RigidBodyAPI+MassAPI.
-    # Fallback: if APIs were stripped by a prior bad run, find child whose
-    # name ends with _E_body or has revolute/prismatic joint descendants.
-    e_body = None
-    for child in wrapper_prim.GetChildren():
-        if child.HasAPI(UsdPhysics.RigidBodyAPI) and child.HasAPI(UsdPhysics.MassAPI):
-            e_body = child
-            break
-
-    if e_body is None:
-        # Fallback: look for child with MassAPI only (RigidBodyAPI may have
-        # been stripped).
-        for child in wrapper_prim.GetChildren():
-            if child.HasAPI(UsdPhysics.MassAPI):
-                e_body = child
-                break
-
-    if e_body is None:
-        # Last resort: find child that has joint descendants.
-        for child in wrapper_prim.GetChildren():
-            for desc in Usd.PrimRange(child):
-                type_name = desc.GetTypeName()
-                if type_name in (
-                    "PhysicsRevoluteJoint",
-                    "PhysicsPrismaticJoint",
-                ):
-                    e_body = child
-                    break
-            if e_body is not None:
-                break
-
-    if e_body is None:
-        console_logger.warning(
-            f"Articulated object {wrapper_path} has no identifiable "
-            "E_body child, skipping."
-        )
-        return
-
-    # Move ArticulationRootAPI from wrapper to E_body.
-    if wrapper_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
-        wrapper_prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
-    UsdPhysics.ArticulationRootAPI.Apply(e_body)
-
-    # Ensure E_body has RigidBodyAPI. Joints reference it as body0 and PhysX
-    # requires both endpoints to be rigid bodies.
-    if not e_body.HasAPI(UsdPhysics.RigidBodyAPI):
-        UsdPhysics.RigidBodyAPI.Apply(e_body)
-
-    # Set kinematic mode on E_body to anchor it in place.
-    kinematic_attr = e_body.GetAttribute("physics:kinematicEnabled")
-    if not kinematic_attr:
-        kinematic_attr = e_body.CreateAttribute(
-            "physics:kinematicEnabled", Sdf.ValueTypeNames.Bool
-        )
-    kinematic_attr.Set(True)
-
-    # Remove RigidBodyAPI and MassAPI from wrapper.
-    remove_rigid_body_api(wrapper_prim)
-    remove_mass_api(wrapper_prim)
-
-    # Delete FixedJoint from wrapper to root.
+    # Determine if this object is welded to world or free-floating.
+    # Welded objects have a FixedJoint from wrapper to the scene root.
     root_joints = find_fixed_joints_with_body0(wrapper_prim, root_path)
+    is_welded = len(root_joints) > 0
+
+    # 1. Remove RigidBodyAPI from the wrapper.
+    remove_rigid_body_api(wrapper_prim)
+
+    # 2. Find the FixedJoint from wrapper→E_body.
+    wrapper_to_body_joints: list[Sdf.Path] = []
+    for descendant in Usd.PrimRange(wrapper_prim):
+        if descendant.GetTypeName() == "PhysicsFixedJoint":
+            body0_rel = descendant.GetRelationship("physics:body0")
+            if body0_rel:
+                targets = body0_rel.GetTargets()
+                if targets and targets[0] == wrapper_path:
+                    wrapper_to_body_joints.append(descendant.GetPath())
+
+    if is_welded:
+        # Fixed-base articulation: keep ArticulationRootAPI, clear body0
+        # to world-anchor E_body.
+        for jp in wrapper_to_body_joints:
+            joint_prim = stage.GetPrimAtPath(jp)
+            if joint_prim:
+                body0_rel = joint_prim.GetRelationship("physics:body0")
+                if body0_rel:
+                    body0_rel.ClearTargets(True)
+        console_logger.debug(f"  {wrapper_path.name}: fixed-base (welded to world)")
+    else:
+        # Free-floating: remove ArticulationRootAPI so bodies are regular
+        # rigid bodies connected by joints. This allows Isaac Sim's
+        # interactive force tools to work on each body. Delete the
+        # internal FixedJoint (not needed without an articulation).
+        if wrapper_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            wrapper_prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+        delete_prims(stage, wrapper_to_body_joints)
+        console_logger.debug(f"  {wrapper_path.name}: free-floating (no articulation)")
+
+    # 3. Delete FixedJoint from wrapper to scene root (invalid target).
     delete_prims(stage, root_joints)
 
-    # Delete FixedJoint from E_body to wrapper.
-    wrapper_joints = find_fixed_joints_with_body0(wrapper_prim, wrapper_path)
-    delete_prims(stage, wrapper_joints)
+    # 4. Reparent child rigid bodies from E_body to wrapper so they are
+    #    siblings across ALL layers (Physics, Geometry, Materials).
+    _reparent_nested_rigid_bodies(stage, wrapper_prim, all_layers)
 
-
-# --- Main entry point ---
+    # 5. Add self-collision filtering between all rigid bodies within this
+    #    object. Mirrors MuJoCo's <contact><exclude> pairs that prevent
+    #    adjacent links from colliding (e.g. wardrobe body vs. door).
+    _add_self_collision_filter(stage, wrapper_prim)
 
 
 def fix_physics_layer(physics_usda_path: Path) -> dict[str, int]:
     """Fix physics in a Physics.usda file for Isaac Sim compatibility.
+
+    Opens the composed stage and fixes all objects. For articulated
+    objects, reparenting is applied across ALL sublayers (Physics,
+    Geometry, Materials) so mesh data and materials move with the prims.
 
     Args:
         physics_usda_path: Path to the Physics.usda file.
@@ -313,6 +442,15 @@ def fix_physics_layer(physics_usda_path: Path) -> dict[str, int]:
     geometry_prim = stage.GetPrimAtPath(geometry_path)
     if not geometry_prim:
         raise RuntimeError(f"No Geometry scope found at {geometry_path}")
+
+    # Collect ALL sublayers in the Payload directory for reparenting.
+    # The Payload dir contains Physics.usda, Geometry.usda, Materials.usda.
+    payload_dir = physics_usda_path.parent
+    all_layers: list[Sdf.Layer] = []
+    for usda_file in sorted(payload_dir.glob("*.usda")):
+        layer = Sdf.Layer.FindOrOpen(str(usda_file))
+        if layer:
+            all_layers.append(layer)
 
     counts: dict[str, int] = {"static": 0, "dynamic": 0, "articulated": 0}
 
@@ -339,9 +477,14 @@ def fix_physics_layer(physics_usda_path: Path) -> dict[str, int]:
                 stage=stage,
                 wrapper_prim=wrapper_prim,
                 root_path=root_path,
+                all_layers=all_layers,
             )
 
+    # Save ALL modified layers (Physics + Geometry + Materials).
     stage.GetRootLayer().Save()
+    for layer in all_layers:
+        if layer.dirty:
+            layer.Save()
 
     console_logger.info(
         f"Fixed {physics_usda_path}: "
