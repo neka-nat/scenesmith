@@ -29,3 +29,18 @@ def has_hunyuan3d_installed() -> bool:
         return True
     except ImportError:
         return False
+
+
+def has_usd_export_env() -> bool:
+    """Check if the MuJoCo/USD export test environment is available."""
+    if os.getenv("SCENESMITH_RUN_USD_EXPORT_TESTS") != "1":
+        return False
+
+    try:
+        import mujoco_usd_converter  # noqa: F401
+
+        from pxr import Usd  # noqa: F401
+
+        return True
+    except ImportError:
+        return False

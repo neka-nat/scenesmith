@@ -35,6 +35,7 @@ import yaml
 from PIL import Image
 from pydrake.all import Quaternion, RigidTransform, RotationMatrix
 
+from scenesmith.agent_utils.drake_utils import create_plant_from_dmd
 from scenesmith.agent_utils.house import HouseScene
 from scenesmith.agent_utils.room import ObjectType, SceneObject, UniqueID
 from scenesmith.utils.sdf_utils import parse_scale
@@ -63,6 +64,132 @@ def apply_scale_to_trimesh(mesh: trimesh.Trimesh, scale: list[float]) -> None:
         return
     scale_matrix = np.diag([scale[0], scale[1], scale[2], 1.0])
     mesh.apply_transform(scale_matrix)
+
+
+def build_mesh_asset_filename(
+    mesh_path: Path,
+    sdf_dir: Path,
+    room_id: str,
+    scale: list[float],
+) -> str:
+    """Build a collision/visual mesh filename that is stable and collision-free.
+
+    Drake-generated articulated assets commonly store per-link collision pieces in
+    sibling directories like:
+
+      E_body_1_combined_coacd/convex_piece_000.obj
+      E_door_1_16_combined_coacd/convex_piece_000.obj
+
+    Flattening those into a shared MuJoCo meshes/ directory by basename alone
+    aliases unrelated meshes together. Include the asset directory and relative
+    subpath so per-link meshes stay distinct.
+    """
+
+    room_prefix = f"{room_id}_" if room_id else ""
+    scale_suffix = ""
+    if scale != [1.0, 1.0, 1.0]:
+        scale_suffix = f"_s{'_'.join(f'{s:.3g}' for s in scale)}"
+
+    try:
+        relative_parts = mesh_path.relative_to(sdf_dir).parts[:-1]
+        relative_prefix = "_".join(relative_parts)
+    except ValueError:
+        relative_prefix = mesh_path.parent.name
+
+    parts = [room_prefix.rstrip("_"), sdf_dir.name, relative_prefix, mesh_path.stem]
+    stem = "_".join(part for part in parts if part)
+    return f"{stem}{scale_suffix}{mesh_path.suffix}"
+
+
+def get_degenerate_trimesh_reason(mesh: trimesh.Trimesh) -> str | None:
+    """Return a human-readable reason when a mesh is not a valid 3D collider."""
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        return f"unexpected vertex shape {vertices.shape}"
+    if vertices.shape[0] < 4:
+        return f"only {vertices.shape[0]} vertices"
+    if not np.isfinite(vertices).all():
+        return "non-finite vertices"
+
+    centered = vertices - vertices.mean(axis=0, keepdims=True)
+    extents = np.ptp(vertices, axis=0)
+    scale = max(float(np.max(extents)), 1.0)
+    tol = max(scale * 1e-6, 1e-9)
+    rank = np.linalg.matrix_rank(centered, tol=tol)
+    if rank < 3:
+        extents_str = ", ".join(f"{extent:.6g}" for extent in extents)
+        return f"rank {rank} geometry with extents [{extents_str}]"
+
+    return None
+
+
+def maybe_drop_degenerate_collision_geom(
+    spec: mujoco.MjSpec,
+    geom: mujoco._specs.MjsGeom,
+    geom_name: str,
+    mesh: trimesh.Trimesh,
+    mesh_path: Path,
+) -> bool:
+    """Delete one collision geom when its mesh is too degenerate for MuJoCo."""
+    reason = get_degenerate_trimesh_reason(mesh)
+    if reason is None:
+        return False
+
+    console_logger.warning(
+        "Dropping degenerate collision geom '%s' from '%s': %s",
+        geom_name,
+        mesh_path,
+        reason,
+    )
+    spec.delete(geom)
+    return True
+
+
+def drop_bad_collision_mesh_from_spec(
+    spec: mujoco.MjSpec,
+    bad_mesh: str,
+    mesh_assets: dict[str, str],
+) -> bool:
+    """Remove a single collision geom+mesh pair when MuJoCo rejects it."""
+    if not bad_mesh.endswith("_mesh"):
+        return False
+
+    geom_name = bad_mesh.removesuffix("_mesh")
+    if not geom_name.endswith("_collision"):
+        return False
+
+    geom = next((geom for geom in spec.geoms if geom.name == geom_name), None)
+    if geom is None:
+        return False
+
+    console_logger.warning(
+        "Dropping collision geom '%s' after MuJoCo rejected mesh '%s'",
+        geom_name,
+        bad_mesh,
+    )
+    spec.delete(geom)
+    mesh_assets.pop(bad_mesh, None)
+
+    mesh = next((mesh for mesh in spec.meshes if mesh.name == bad_mesh), None)
+    if mesh is not None:
+        spec.delete(mesh)
+    return True
+
+
+def get_bad_mesh_name_from_compile_error(err_str: str) -> str | None:
+    """Extract the offending mesh name from common MuJoCo compile errors."""
+    volume_match = re.search(r"mesh volume is too small: (\S+)", err_str)
+    if volume_match:
+        return volume_match.group(1)
+
+    if "qhull error" not in err_str:
+        return None
+
+    qhull_match = re.search(r"Element name '([^']+)'", err_str)
+    if qhull_match:
+        return qhull_match.group(1)
+
+    return None
 
 
 def parse_transform_dict(transform_data: dict) -> RigidTransform:
@@ -161,6 +288,25 @@ def parse_dmd_yaml(dmd_path: Path) -> list[dict]:
     return data.get("directives", []) if data else []
 
 
+def get_model_directives(directives: list[dict]) -> list[dict]:
+    """Extract add_model directives in order."""
+    return [d["add_model"] for d in directives if "add_model" in d]
+
+
+def get_weld_directives_by_model(directives: list[dict]) -> dict[str, dict]:
+    """Index add_weld directives by child model name."""
+    welds: dict[str, dict] = {}
+    for directive in directives:
+        if "add_weld" not in directive:
+            continue
+        child = directive["add_weld"].get("child", "")
+        if "::" not in child:
+            continue
+        model_name = child.split("::", 1)[0]
+        welds[model_name] = directive["add_weld"]
+    return welds
+
+
 def get_welded_models(directives: list[dict]) -> set[str]:
     """Extract model names that are welded (to any parent) from DMD directives.
 
@@ -229,6 +375,121 @@ def resolve_package_uri(uri: str, sdf_dir: Path) -> Path | None:
         return candidate
 
     return None
+
+
+def resolve_scene_file_uri(uri: str, scene_dir: Path, dmd_dir: Path) -> Path | None:
+    """Resolve a DMD add_model file URI to a filesystem path."""
+    if uri.startswith("package://scene/"):
+        rel_path = uri[len("package://scene/") :]
+        candidate = scene_dir / rel_path
+        if candidate.exists():
+            return candidate
+        return None
+
+    if uri.startswith("file://"):
+        candidate = Path(uri[len("file://") :])
+        return candidate if candidate.exists() else None
+
+    candidate = Path(uri)
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+
+    candidate = dmd_dir / uri
+    return candidate if candidate.exists() else None
+
+
+def get_sdf_link_poses_and_roots(
+    sdf_path: Path,
+) -> tuple[dict[str, tuple[list[float], list[float]]], list[str]]:
+    """Return model-frame link poses and root links for an SDF model."""
+    tree = parse_sdf_with_drake_namespace(sdf_path)
+    root = tree.getroot()
+    model_elem = root.find(".//model")
+    if model_elem is None:
+        return {}, []
+
+    link_absolute_poses: dict[str, tuple[list[float], list[float]]] = {}
+    links = model_elem.findall("./link")
+    for link_elem in links:
+        link_name = link_elem.get("name")
+        if not link_name:
+            continue
+        link_absolute_poses[link_name] = parse_pose(link_elem.find("pose"))
+
+    child_links = set()
+    for joint_elem in model_elem.findall("./joint"):
+        child_elem = joint_elem.find("child")
+        if child_elem is not None and child_elem.text:
+            child_links.add(child_elem.text)
+
+    root_links = [
+        link_elem.get("name")
+        for link_elem in links
+        if link_elem.get("name") and link_elem.get("name") not in child_links
+    ]
+    return link_absolute_poses, root_links
+
+
+def get_dmd_reference_link_name(
+    add_model_data: dict,
+    weld_data: dict | None,
+    link_absolute_poses: dict[str, tuple[list[float], list[float]]],
+    root_links: list[str],
+) -> str | None:
+    """Choose the link whose DMD-authored world pose should anchor the model."""
+    free_body_pose = add_model_data.get("default_free_body_pose", {})
+    if free_body_pose:
+        link_name = next(iter(free_body_pose))
+        if link_name in link_absolute_poses:
+            return link_name
+
+    if weld_data:
+        child = weld_data.get("child", "")
+        if "::" in child:
+            link_name = child.split("::", 1)[1]
+            if link_name in link_absolute_poses:
+                return link_name
+
+    if len(root_links) == 1:
+        return root_links[0]
+
+    if root_links:
+        return root_links[0]
+
+    if link_absolute_poses:
+        return next(iter(link_absolute_poses))
+
+    return None
+
+
+def infer_is_furniture_from_sdf_path(sdf_path: Path) -> bool:
+    """Infer furniture-ness from the packaged scene asset path."""
+    path_str = sdf_path.as_posix()
+    return "/generated_assets/furniture/" in path_str
+
+
+def infer_room_id_from_scene_asset_path(scene_dir: Path, sdf_path: Path) -> str:
+    """Infer room_id from a packaged scene asset path.
+
+    Examples:
+    - scene_dir/room_bedroom/generated_assets/... -> bedroom
+    - scene_dir/room_geometry/room_geometry_bathroom.sdf -> bathroom
+    """
+    try:
+        rel_path = sdf_path.relative_to(scene_dir)
+    except ValueError:
+        rel_path = sdf_path
+
+    if rel_path.parts:
+        first = rel_path.parts[0]
+        if first.startswith("room_") and first != "room_geometry":
+            return first[len("room_") :]
+
+    stem = sdf_path.stem
+    if stem.startswith("room_geometry_"):
+        return stem[len("room_geometry_") :]
+
+    return ""
 
 
 def parse_sdf_with_drake_namespace(sdf_path: Path) -> ET.ElementTree:
@@ -735,6 +996,7 @@ def process_sdf_model(
 
             for collision_elem in link_elem.findall("collision"):
                 add_geom_from_sdf(
+                    spec=spec,
                     body=body,
                     geom_elem=collision_elem,
                     sdf_dir=sdf_dir,
@@ -749,6 +1011,7 @@ def process_sdf_model(
 
             for visual_elem in link_elem.findall("visual"):
                 add_geom_from_sdf(
+                    spec=spec,
                     body=body,
                     geom_elem=visual_elem,
                     sdf_dir=sdf_dir,
@@ -974,9 +1237,158 @@ def export_scene_to_mujoco(
             if len(body_names) > 1:
                 articulated_model_bodies.append(body_names)
 
-    # Add self-collision exclusions for articulated models. Prevents
-    # parent-child and sibling collisions within the same articulated
-    # furniture piece.
+    add_articulated_self_collision_exclusions(spec, articulated_model_bodies)
+    add_mujoco_assets_to_spec(spec, mesh_assets, texture_assets)
+    return compile_and_write_mjcf(
+        spec=spec,
+        output_path=output_path,
+        meshes_dir=meshes_dir,
+        mesh_assets=mesh_assets,
+        texture_assets=texture_assets,
+    )
+
+
+def export_dmd_scene_to_mujoco(
+    scene_dir: Path,
+    dmd_path: Path,
+    output_dir: Path,
+    include_floor_plan: bool = True,
+    weld_furniture: bool = False,
+) -> Path:
+    """Export a scene directly from house.dmd.yaml plus referenced SDF assets.
+
+    This is the clean fallback for archived scenes that still contain the
+    authoritative Drake directives and packaged SDF assets but no longer keep
+    house_state.json metadata around.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    meshes_dir = output_dir / "meshes"
+    meshes_dir.mkdir(exist_ok=True)
+
+    output_path = output_dir / "scene.xml"
+
+    spec = create_mujoco_spec_with_environment(
+        model_name=f"scene_{scene_dir.name}",
+        ground_collides=False,
+    )
+
+    mesh_assets: dict[str, str] = {}
+    texture_assets: dict[str, str] = {}
+    color_assets: dict[str, list[float]] = {}
+    articulated_model_bodies: list[list[str]] = []
+
+    directives = parse_dmd_yaml(dmd_path)
+    model_directives = get_model_directives(directives)
+    welded_models = get_welded_models(directives)
+    weld_directives = get_weld_directives_by_model(directives)
+
+    console_logger.info(
+        f"Loaded {len(model_directives)} model directive(s) from {dmd_path.name}"
+    )
+
+    builder, plant, scene_graph = create_plant_from_dmd(dmd_path, scene_dir)
+    del builder, scene_graph
+    context = plant.CreateDefaultContext()
+
+    for add_model_data in model_directives:
+        model_name = add_model_data.get("name")
+        file_uri = add_model_data.get("file")
+        if not model_name or not file_uri:
+            continue
+
+        if not include_floor_plan and model_name.startswith("room_geometry_"):
+            continue
+
+        sdf_path = resolve_scene_file_uri(
+            file_uri, scene_dir=scene_dir, dmd_dir=dmd_path.parent
+        )
+        if sdf_path is None or not sdf_path.exists():
+            console_logger.warning(f"SDF not found for {model_name}: {file_uri}")
+            continue
+
+        room_id = infer_room_id_from_scene_asset_path(scene_dir, sdf_path)
+
+        link_absolute_poses, root_links = get_sdf_link_poses_and_roots(sdf_path)
+        weld_data = weld_directives.get(model_name)
+        reference_link_name = get_dmd_reference_link_name(
+            add_model_data=add_model_data,
+            weld_data=weld_data,
+            link_absolute_poses=link_absolute_poses,
+            root_links=root_links,
+        )
+        if reference_link_name is None:
+            console_logger.warning(
+                f"Could not determine reference link for {model_name}: {sdf_path}"
+            )
+            continue
+
+        try:
+            model_instance = plant.GetModelInstanceByName(model_name)
+            reference_body = plant.GetBodyByName(reference_link_name, model_instance)
+        except RuntimeError as exc:
+            console_logger.warning(
+                f"Skipping {model_name}; Drake model lookup failed: {exc}"
+            )
+            continue
+
+        x_wl = plant.EvalBodyPoseInWorld(context, reference_body)
+        ref_pos, ref_quat = link_absolute_poses.get(
+            reference_link_name, ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0])
+        )
+        x_ml = RigidTransform(
+            RotationMatrix(Quaternion(wxyz=ref_quat)),
+            ref_pos,
+        )
+        x_wm = x_wl @ x_ml.inverse()
+        q_wm = x_wm.rotation().ToQuaternion()
+
+        is_static = model_name in welded_models or (
+            weld_furniture and infer_is_furniture_from_sdf_path(sdf_path)
+        )
+
+        body_names = process_sdf_model(
+            sdf_path=sdf_path,
+            sdf_dir=sdf_path.parent,
+            model_name=model_name,
+            transform_pos=[
+                float(x_wm.translation()[0]),
+                float(x_wm.translation()[1]),
+                float(x_wm.translation()[2]),
+            ],
+            transform_quat=[
+                float(q_wm.w()),
+                float(q_wm.x()),
+                float(q_wm.y()),
+                float(q_wm.z()),
+            ],
+            is_static=is_static,
+            spec=spec,
+            meshes_dir=meshes_dir,
+            mesh_assets=mesh_assets,
+            texture_assets=texture_assets,
+            color_assets=color_assets,
+            room_id=room_id,
+        )
+        if len(body_names) > 1:
+            articulated_model_bodies.append(body_names)
+
+    add_articulated_self_collision_exclusions(spec, articulated_model_bodies)
+    add_mujoco_assets_to_spec(spec, mesh_assets, texture_assets)
+    return compile_and_write_mjcf(
+        spec=spec,
+        output_path=output_path,
+        meshes_dir=meshes_dir,
+        mesh_assets=mesh_assets,
+        texture_assets=texture_assets,
+    )
+
+
+def add_articulated_self_collision_exclusions(
+    spec: mujoco.MjSpec,
+    articulated_model_bodies: list[list[str]],
+) -> None:
+    """Disable self-collisions within each articulated model."""
     for body_names in articulated_model_bodies:
         for i in range(len(body_names)):
             for j in range(i + 1, len(body_names)):
@@ -985,78 +1397,56 @@ def export_scene_to_mujoco(
                 exclude.bodyname1 = body_names[i]
                 exclude.bodyname2 = body_names[j]
 
-    # Add mesh assets to spec. Just filenames - meshdir is added to XML later.
+
+def add_mujoco_assets_to_spec(
+    spec: mujoco.MjSpec,
+    mesh_assets: dict[str, str],
+    texture_assets: dict[str, str],
+) -> None:
+    """Attach mesh and texture assets to the MuJoCo spec."""
     for mesh_name, mesh_filename in mesh_assets.items():
         mesh = spec.add_mesh(name=mesh_name)
         mesh.file = mesh_filename
 
-    # Add texture and material assets to spec. Just filenames - texturedir added later.
     for texture_name, texture_filename in texture_assets.items():
         texture = spec.add_texture(name=texture_name)
         texture.file = texture_filename
         texture.type = mujoco.mjtTexture.mjTEXTURE_2D
 
-        # Create material that uses this texture.
-        # MjsMaterial.textures is indexed by mjtTextureRole.
         material = spec.add_material(name=texture_name)
         material.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = texture_name
 
     console_logger.info(f"Total textures: {len(texture_assets)}")
 
-    # Compile and export. We chdir to meshes_dir so filenames resolve correctly
-    # (meshdir/texturedir not available in MjSpec 3.3.5).
+
+def compile_and_write_mjcf(
+    spec: mujoco.MjSpec,
+    output_path: Path,
+    meshes_dir: Path,
+    mesh_assets: dict[str, str],
+    texture_assets: dict[str, str],
+) -> Path:
+    """Compile an MjSpec and write the final XML next to its mesh assets."""
     original_cwd = os.getcwd()
     try:
         os.chdir(meshes_dir)
-        try:
-            spec.compile()
-        except ValueError as e:
-            err_str = str(e)
-            if "mesh volume is too small" in err_str:
-                # MuJoCo 3.3.5 lacks shellinertia. Replace degenerate mesh
-                # files with a tiny tetrahedron so compilation succeeds.
-                import re as _re
-
-                _replaced: set[str] = set()
-                while True:
-                    match = _re.search(r"mesh volume is too small: (\S+)", err_str)
-                    if not match or match.group(1) in _replaced:
-                        raise
-                    bad_mesh = match.group(1)
-                    console_logger.warning(
-                        f"Replacing degenerate mesh '{bad_mesh}' with "
-                        f"tiny tetrahedron"
-                    )
-                    # Find the mesh asset and replace its file with a
-                    # small valid tetrahedron OBJ.
-                    for m in spec.meshes:
-                        if m.name == bad_mesh:
-                            tet_path = meshes_dir / f"{bad_mesh}_tet.obj"
-                            tet_path.write_text(
-                                "v 0.0 0.0 0.0\n"
-                                "v 0.01 0.0 0.0\n"
-                                "v 0.0 0.01 0.0\n"
-                                "v 0.0 0.0 0.01\n"
-                                "f 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n"
-                            )
-                            m.file = str(tet_path.name)
-                            break
-                    _replaced.add(bad_mesh)
-                    try:
-                        spec.compile()
-                        break
-                    except ValueError as e2:
-                        err_str = str(e2)
-                        if "mesh volume is too small" not in err_str:
-                            raise
-            else:
-                raise
+        dropped_meshes: set[str] = set()
+        while True:
+            try:
+                spec.compile()
+                break
+            except ValueError as e:
+                err_str = str(e)
+                bad_mesh = get_bad_mesh_name_from_compile_error(err_str)
+                if bad_mesh is None or bad_mesh in dropped_meshes:
+                    raise
+                if not drop_bad_collision_mesh_from_spec(spec, bad_mesh, mesh_assets):
+                    raise
+                dropped_meshes.add(bad_mesh)
         xml_string = spec.to_xml()
     finally:
         os.chdir(original_cwd)
 
-    # Add meshdir/texturedir to compiler element for clarity.
-    # Handle both self-closing <compiler .../> and open <compiler ...> tags.
     xml_string = re.sub(
         r"<compiler([^/]*)/\s*>",
         r'<compiler\1 meshdir="meshes" texturedir="meshes"/>',
@@ -1074,6 +1464,7 @@ def export_scene_to_mujoco(
     console_logger.info(f"Exported MJCF to: {output_path}")
     console_logger.info(f"Mesh assets in: {meshes_dir}")
     console_logger.info(f"Total meshes: {len(mesh_assets)}")
+    console_logger.info(f"Total textures: {len(texture_assets)}")
 
     return output_path
 
@@ -1334,6 +1725,7 @@ def add_joint_from_sdf(
 
 
 def add_geom_from_sdf(
+    spec: mujoco.MjSpec,
     body: mujoco._specs.MjsBody,
     geom_elem: ET.Element,
     sdf_dir: Path,
@@ -1347,7 +1739,8 @@ def add_geom_from_sdf(
 ) -> None:
     """Add geometry to body from SDF visual or collision element."""
     base_name = geom_elem.get("name", "geom")
-    geom_name = f"{name_prefix}_{base_name}"
+    geom_kind = "collision" if is_collision else "visual"
+    geom_name = f"{name_prefix}_{base_name}_{geom_kind}"
 
     geometry_elem = geom_elem.find("geometry")
     if geometry_elem is None:
@@ -1411,6 +1804,7 @@ def add_geom_from_sdf(
         uri_elem = mesh_elem.find("uri")
         scale_elem = mesh_elem.find("scale")
         mesh_scale = [1.0, 1.0, 1.0]
+        base_color_name = None
         if scale_elem is not None and scale_elem.text:
             mesh_scale = parse_scale(scale_elem.text)
         if uri_elem is not None and uri_elem.text:
@@ -1452,9 +1846,11 @@ def add_geom_from_sdf(
                             console_logger.warning(
                                 f"Skipping mesh {mesh_name}: GLTF conversion failed"
                             )
-                            # Use default box as fallback.
-                            geom.type = mujoco.mjtGeom.mjGEOM_BOX
-                            geom.size = [0.1, 0.1, 0.1]
+                            if is_collision:
+                                spec.delete(geom)
+                            else:
+                                geom.type = mujoco.mjtGeom.mjGEOM_BOX
+                                geom.size = [0.1, 0.1, 0.1]
                             return
                         # Track texture if extracted.
                         if texture_path and texture_path.exists():
@@ -1477,38 +1873,62 @@ def add_geom_from_sdf(
                             if base_color:
                                 color_assets[base_color_name] = base_color
 
+                    if is_collision:
+                        try:
+                            collision_mesh = trimesh.load(obj_path, force="mesh")
+                        except Exception as e:
+                            console_logger.warning(
+                                f"Failed to validate converted collision mesh {obj_path}: {e}"
+                            )
+                            spec.delete(geom)
+                            return
+                        if maybe_drop_degenerate_collision_geom(
+                            spec=spec,
+                            geom=geom,
+                            geom_name=geom_name,
+                            mesh=collision_mesh,
+                            mesh_path=obj_path,
+                        ):
+                            return
+
                     mesh_assets[mesh_name] = obj_filename
                 else:
                     # OBJ/STL mesh - validate and optionally scale.
                     try:
                         existing_mesh = trimesh.load(mesh_path, force="mesh")
-                        if existing_mesh.vertices.shape[0] < 4:
-                            console_logger.warning(
-                                f"Mesh {mesh_path.name} has only "
-                                f"{existing_mesh.vertices.shape[0]} vertices "
-                                f"(MuJoCo requires at least 4). Using box fallback."
-                            )
-                            geom.type = mujoco.mjtGeom.mjGEOM_BOX
-                            geom.size = [0.05, 0.05, 0.05]
-                            return
                     except Exception as e:
                         console_logger.warning(
                             f"Failed to validate mesh {mesh_path}: {e}"
                         )
-                        geom.type = mujoco.mjtGeom.mjGEOM_BOX
-                        geom.size = [0.05, 0.05, 0.05]
+                        if is_collision:
+                            spec.delete(geom)
+                        else:
+                            geom.type = mujoco.mjtGeom.mjGEOM_BOX
+                            geom.size = [0.05, 0.05, 0.05]
                         return
 
-                    # Include scale in filename if scaling is needed.
-                    scale_suffix = ""
                     if mesh_scale != [1.0, 1.0, 1.0]:
-                        scale_suffix = f"_s{'_'.join(f'{s:.3g}' for s in mesh_scale)}"
-                    dest_filename = f"{mesh_path.stem}{scale_suffix}{mesh_path.suffix}"
+                        apply_scale_to_trimesh(existing_mesh, mesh_scale)
+
+                    if is_collision and maybe_drop_degenerate_collision_geom(
+                        spec=spec,
+                        geom=geom,
+                        geom_name=geom_name,
+                        mesh=existing_mesh,
+                        mesh_path=mesh_path,
+                    ):
+                        return
+
+                    dest_filename = build_mesh_asset_filename(
+                        mesh_path=mesh_path,
+                        sdf_dir=sdf_dir,
+                        room_id=room_id,
+                        scale=mesh_scale,
+                    )
                     dest_path = meshes_dir / dest_filename
                     if not dest_path.exists():
                         if mesh_scale != [1.0, 1.0, 1.0]:
-                            # Apply scale and export.
-                            apply_scale_to_trimesh(existing_mesh, mesh_scale)
+                            # The mesh already has the export scale applied in-memory.
                             existing_mesh.export(dest_path)
                             console_logger.info(
                                 f"Scaled mesh {mesh_path.name} -> {dest_filename}"
@@ -1530,7 +1950,7 @@ def add_geom_from_sdf(
             if not is_collision:
                 if texture_name:
                     geom.material = texture_name
-                elif base_color_name in color_assets:
+                elif base_color_name and base_color_name in color_assets:
                     # Apply base color directly to geom.
                     geom.rgba = color_assets[base_color_name]
         return
@@ -1615,35 +2035,13 @@ def export_sdf_to_mujoco(
 
     console_logger.info(f"Processed model: {model_name}")
 
-    # Compile and export.
-    original_cwd = os.getcwd()
-    try:
-        os.chdir(meshes_dir)
-        spec.compile()
-        xml_string = spec.to_xml()
-    finally:
-        os.chdir(original_cwd)
-
-    # Add meshdir/texturedir.
-    xml_string = re.sub(
-        r"<compiler([^/]*)/\s*>",
-        r'<compiler\1 meshdir="meshes" texturedir="meshes"/>',
-        xml_string,
+    return compile_and_write_mjcf(
+        spec=spec,
+        output_path=output_path,
+        meshes_dir=meshes_dir,
+        mesh_assets=mesh_assets,
+        texture_assets=texture_assets,
     )
-    xml_string = re.sub(
-        r"<compiler([^/>]*)>",
-        r'<compiler\1 meshdir="meshes" texturedir="meshes">',
-        xml_string,
-    )
-
-    with open(output_path, "w") as f:
-        f.write(xml_string)
-
-    console_logger.info(f"Exported MJCF to: {output_path}")
-    console_logger.info(f"Mesh assets in: {meshes_dir}")
-    console_logger.info(f"Total meshes: {len(mesh_assets)}")
-
-    return output_path
 
 
 def fix_usd_texture_wrap_modes(materials_lib_path: Path) -> None:
@@ -1678,7 +2076,11 @@ def fix_usd_texture_wrap_modes(materials_lib_path: Path) -> None:
     console_logger.info(f"  Fixed wrap mode on {textures_fixed} texture shaders")
 
 
-def export_to_usd(output_path: Path, output_dir: Path) -> None:
+def export_to_usd(
+    output_path: Path,
+    output_dir: Path,
+    apply_isaac_sim_fix: bool = True,
+) -> None:
     """Export MuJoCo scene to USD format.
 
     Args:
@@ -1761,7 +2163,7 @@ def export_to_usd(output_path: Path, output_dir: Path) -> None:
 
         # Fix physics for Isaac Sim compatibility.
         physics_path = usd_dir / "Payload" / "Physics.usda"
-        if physics_path.exists():
+        if apply_isaac_sim_fix and physics_path.exists():
             from fix_usd_isaac_sim import fix_physics_layer
 
             fix_physics_layer(physics_path)
@@ -1857,6 +2259,14 @@ def main():
         action="store_true",
         help="Also export to USD format (OpenUSD/Universal Scene Description)",
     )
+    parser.add_argument(
+        "--skip-isaac-sim-fix",
+        action="store_true",
+        help=(
+            "When exporting USD, skip the Isaac Sim compatibility fixer and "
+            "leave the raw mujoco-usd-converter output untouched"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1891,7 +2301,11 @@ def main():
 
         # Export to USD if requested.
         if args.usd:
-            export_to_usd(output_path, output_dir)
+            export_to_usd(
+                output_path,
+                output_dir,
+                apply_isaac_sim_fix=not args.skip_isaac_sim_fix,
+            )
 
         return
 
@@ -1906,23 +2320,36 @@ def main():
 
     output_dir = args.output or scene_path / "mujoco"
 
-    console_logger.info(f"Loading house from: {scene_path}")
+    console_logger.info(f"Loading scene from: {scene_path}")
 
-    # Load house scene.
-    try:
-        house = load_house_from_directory(scene_path)
-    except FileNotFoundError as e:
-        console_logger.error(str(e))
-        sys.exit(1)
+    house_state_path = scene_path / "combined_house" / "house_state.json"
+    dmd_path = scene_path / "combined_house" / "house.dmd.yaml"
 
-    # Export to MuJoCo.
     console_logger.info(f"Exporting to: {output_dir}")
-    output_path = export_scene_to_mujoco(
-        house=house,
-        output_dir=output_dir,
-        include_floor_plan=not args.no_floor_plan,
-        weld_furniture=args.weld_furniture,
-    )
+    if house_state_path.exists():
+        house = load_house_from_directory(scene_path)
+        output_path = export_scene_to_mujoco(
+            house=house,
+            output_dir=output_dir,
+            include_floor_plan=not args.no_floor_plan,
+            weld_furniture=args.weld_furniture,
+        )
+    elif dmd_path.exists():
+        console_logger.info(
+            "house_state.json missing; exporting directly from house.dmd.yaml"
+        )
+        output_path = export_dmd_scene_to_mujoco(
+            scene_dir=scene_path,
+            dmd_path=dmd_path,
+            output_dir=output_dir,
+            include_floor_plan=not args.no_floor_plan,
+            weld_furniture=args.weld_furniture,
+        )
+    else:
+        console_logger.error(
+            f"Missing scene metadata: expected {house_state_path} or {dmd_path}"
+        )
+        sys.exit(1)
 
     # Validate export.
     if not args.skip_validation:
@@ -1940,7 +2367,11 @@ def main():
 
     # Export to USD if requested.
     if args.usd:
-        export_to_usd(output_path, output_dir)
+        export_to_usd(
+            output_path,
+            output_dir,
+            apply_isaac_sim_fix=not args.skip_isaac_sim_fix,
+        )
 
 
 if __name__ == "__main__":
