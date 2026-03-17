@@ -1,0 +1,63 @@
+# Single-stage Dockerfile for Modal image builds.
+# Modal's legacy image builder does not resolve intra-Dockerfile stage aliases
+# reliably, so this version avoids `FROM <stage>` references entirely.
+
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3.11-distutils \
+    libpython3.11-dev \
+    git \
+    git-lfs \
+    wget \
+    unzip \
+    bubblewrap \
+    cmake \
+    build-essential \
+    libgl1 \
+    libegl1 \
+    libxrender1 \
+    libxkbcommon0 \
+    libsm6 \
+    libxext6 \
+    libxi6 \
+    libxxf86vm1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+RUN python -m ensurepip --upgrade
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV PATH="${CUDA_HOME}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock .python-version README.md ./
+RUN uv sync --frozen --no-dev
+
+COPY scripts/install_sam3d_docker.sh scripts/install_sam3d_docker.sh
+RUN UV_NO_CONFIG=1 TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
+    bash scripts/install_sam3d_docker.sh
+
+COPY . .
+
+RUN find /app/scenesmith -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null; true
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-c", "print('scenesmith Modal container\\nSee docs/modal.md for usage.')"]

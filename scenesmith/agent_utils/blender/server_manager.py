@@ -163,7 +163,12 @@ class BlenderServer:
 
             # Apply GPU isolation via bubblewrap if gpu_id is set.
             if self._gpu_id is not None:
-                if self._is_bwrap_available():
+                if self._is_bwrap_disabled():
+                    console_logger.info(
+                        "Bubblewrap disabled via SCENESMITH_DISABLE_BWRAP; "
+                        "using shared GPU visibility for BlenderServer"
+                    )
+                elif self._is_bwrap_available():
                     cmd = self._build_bwrap_command(cmd=cmd, gpu_id=self._gpu_id)
                     console_logger.info(
                         f"BlenderServer using GPU {self._gpu_id} via bubblewrap"
@@ -224,6 +229,11 @@ class BlenderServer:
     def _is_bwrap_available(self) -> bool:
         """Check if bubblewrap is installed."""
         return shutil.which("bwrap") is not None
+
+    def _is_bwrap_disabled(self) -> bool:
+        """Check whether bubblewrap should be skipped via environment flag."""
+        value = os.environ.get("SCENESMITH_DISABLE_BWRAP", "")
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _build_bwrap_command(self, cmd: list[str], gpu_id: int) -> list[str]:
         """Wrap command in bubblewrap for GPU isolation.

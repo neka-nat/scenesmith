@@ -1,5 +1,6 @@
 import hashlib
 import io
+import os
 import tempfile
 import unittest
 
@@ -511,6 +512,46 @@ class TestBlenderServer(unittest.TestCase):
         self.assertTrue(server.is_running())
         # Should set actual port.
         self.assertEqual(server._actual_port, 8000)
+
+    @patch(
+        "scenesmith.agent_utils.blender.server_manager.is_port_available",
+        return_value=True,
+    )
+    @patch("tempfile.TemporaryDirectory")
+    @patch("subprocess.Popen")
+    @patch.object(Path, "exists", return_value=True)
+    @patch("shutil.which", return_value="/usr/bin/bwrap")
+    def test_start_skips_bwrap_when_disabled_by_env(
+        self,
+        mock_which,
+        mock_exists,
+        mock_popen,
+        mock_temp_dir,
+        mock_port_available,
+    ):
+        """Test that SCENESMITH_DISABLE_BWRAP bypasses bubblewrap wrapping."""
+        mock_temp_dir_instance = Mock()
+        mock_temp_dir_instance.name = "/tmp/test"
+        mock_temp_dir.return_value = mock_temp_dir_instance
+
+        mock_process = Mock()
+        mock_process.pid = 12345
+        mock_process.poll.return_value = None
+        mock_popen.return_value = mock_process
+
+        server = BlenderServer(
+            port=8000,
+            gpu_id=0,
+            server_startup_delay=0.0,
+            port_cleanup_delay=0.0,
+        )
+
+        with patch.dict(os.environ, {"SCENESMITH_DISABLE_BWRAP": "1"}):
+            server.start()
+
+        call_args = mock_popen.call_args[0][0]
+        self.assertNotEqual(call_args[0], "bwrap")
+        self.assertIn("standalone_server.py", call_args[1])
 
     @patch("tempfile.TemporaryDirectory")
     def test_stop_cleans_up_resources(self, mock_temp_dir):
