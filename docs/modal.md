@@ -32,26 +32,53 @@ modal run scripts/scenesmith_modal.py::prepare_data --material-limit 100
 ## 3. Generate a scene
 
 ```bash
-modal run scripts/scenesmith_modal.py \
+uv run modal run scripts/scenesmith_modal.py \
   --prompt "A modern kitchen with an island and cluttered countertops." \
   --mode room
 ```
 
-For explicit Hydra overrides:
+The Modal wrapper now defaults to a 24-hour function timeout. Override it if needed:
 
 ```bash
-modal run scripts/scenesmith_modal.py \
-  --prompt "A studio apartment with a bed and desk." \
-  --extra-overrides "experiment.pipeline.stop_stage=furniture"
+SCENESMITH_MODAL_GENERATE_TIMEOUT_S=43200 \
+uv run modal run scripts/scenesmith_modal.py \
+  --prompt "A studio apartment with a bed and desk."
 ```
 
-## 4. Retrieve outputs
+## 4. Split long runs by pipeline stage
+
+If a full run takes too long, stop after an expensive checkpointed stage and resume later.
+
+First pass, stop after furniture:
+
+```bash
+uv run modal run scripts/scenesmith_modal.py \
+  --prompt "A studio apartment with a bed and desk." \
+  --run-name studio_base \
+  --stop-stage furniture
+```
+
+Later, branch from that saved run and continue from wall-mounted objects:
+
+```bash
+uv run modal run scripts/scenesmith_modal.py \
+  --prompt "A studio apartment with a bed and desk." \
+  --run-name studio_final \
+  --start-stage wall_mounted \
+  --resume-run-id studio_base
+```
+
+Use `--start-stage ceiling_mounted` or `--start-stage manipuland` to rerun only later stages. For raw Hydra overrides, `--extra-overrides` is still passed through unchanged.
+
+To continue writing into the same output directory after a timeout, rerun with the original `--run-name` and a later `--start-stage`.
+
+## 5. Retrieve outputs
 
 The default output volume name is `scenesmith-outputs`:
 
 ```bash
-modal volume ls scenesmith-outputs /
-modal volume get scenesmith-outputs modal_YYYYMMDD_HHMMSS ./modal-output
+uv run modal volume ls scenesmith-outputs /
+uv run modal volume get scenesmith-outputs modal_YYYYMMDD_HHMMSS ./modal-output
 ```
 
 ## Notes
@@ -59,3 +86,4 @@ modal volume get scenesmith-outputs modal_YYYYMMDD_HHMMSS ./modal-output
 - The Modal path forces `SCENESMITH_DISABLE_BWRAP=1`, because Modal does not provide the container capabilities used by docker-compose for bubblewrap GPU isolation.
 - The script defaults to `gpu="L40S"`. Override with `SCENESMITH_MODAL_GPU=A100-80GB` if needed.
 - Volume and secret names can be overridden with `SCENESMITH_MODAL_*` environment variables before running `modal run`.
+- Modal Function timeouts currently max out at 24 hours; longer jobs should be made resumable with stage splits and the output volume. Source: https://modal.com/docs/examples/long-training

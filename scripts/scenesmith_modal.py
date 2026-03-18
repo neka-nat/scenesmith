@@ -46,6 +46,55 @@ OUTPUT_VOLUME_NAME = os.environ.get(
     "SCENESMITH_MODAL_OUTPUT_VOLUME", "scenesmith-outputs"
 )
 DEFAULT_GPU = os.environ.get("SCENESMITH_MODAL_GPU", "L40S")
+PIPELINE_STAGES = (
+    "floor_plan",
+    "furniture",
+    "wall_mounted",
+    "ceiling_mounted",
+    "manipuland",
+)
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    min_value: int = 1,
+    max_value: int | None = None,
+) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+
+    if value < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {value}")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"{name} must be <= {max_value}, got {value}")
+    return value
+
+
+PREPARE_TIMEOUT_S = _env_int(
+    "SCENESMITH_MODAL_PREPARE_TIMEOUT_S",
+    3 * 60 * 60,
+    min_value=10,
+    max_value=24 * 60 * 60,
+)
+GENERATE_TIMEOUT_S = _env_int(
+    "SCENESMITH_MODAL_GENERATE_TIMEOUT_S",
+    24 * 60 * 60,
+    min_value=10,
+    max_value=24 * 60 * 60,
+)
+GENERATE_STARTUP_TIMEOUT_S = _env_int(
+    "SCENESMITH_MODAL_GENERATE_STARTUP_TIMEOUT_S",
+    60 * 60,
+    min_value=10,
+)
 
 app = modal.App(APP_NAME)
 
@@ -230,6 +279,36 @@ def _runtime_env() -> dict[str, str]:
     }
 
 
+def _validate_stage(stage: str, field_name: str) -> None:
+    if stage not in PIPELINE_STAGES:
+        raise ValueError(
+            f"{field_name} must be one of {PIPELINE_STAGES}, got {stage!r}"
+        )
+
+
+def _resolve_resume_source(
+    resume_from_path: str,
+    resume_run_id: str,
+) -> str | None:
+    if resume_from_path and resume_run_id:
+        raise ValueError("Use either resume_from_path or resume_run_id, not both")
+
+    if resume_from_path:
+        return resume_from_path.strip()
+
+    if not resume_run_id.strip():
+        return None
+
+    run_id = resume_run_id.strip()
+    if Path(run_id).name != run_id:
+        raise ValueError("resume_run_id must be a run directory name, not a path")
+
+    source_path = OUTPUT_ROOT / run_id
+    if not source_path.exists():
+        raise RuntimeError(f"Resume source does not exist: {source_path}")
+    return str(source_path)
+
+
 def _ensure_runtime_prereqs() -> None:
     missing = []
     if not os.environ.get("OPENAI_API_KEY"):
@@ -257,7 +336,7 @@ def _ensure_runtime_prereqs() -> None:
     image=image,
     cpu=8,
     memory=32768,
-    timeout=3 * 60 * 60,
+    timeout=PREPARE_TIMEOUT_S,
     secrets=[runtime_secret],
     volumes={
         str(DATA_ROOT): data_volume,
@@ -294,7 +373,8 @@ def prepare_data(material_limit: int = 100, download_materials: bool = True) -> 
     gpu=DEFAULT_GPU,
     cpu=16,
     memory=65536,
-    timeout=6 * 60 * 60,
+    timeout=GENERATE_TIMEOUT_S,
+    startup_timeout=GENERATE_STARTUP_TIMEOUT_S,
     secrets=[runtime_secret],
     volumes={
         str(DATA_ROOT): data_volume,
@@ -306,6 +386,10 @@ def generate_scene(
     prompt: str,
     mode: str = "room",
     run_name: str | None = None,
+    start_stage: str = "floor_plan",
+    stop_stage: str = "manipuland",
+    resume_from_path: str = "",
+    resume_run_id: str = "",
     extra_overrides: str = "",
 ) -> dict:
     """Run SceneSmith on Modal for a single prompt."""
@@ -313,6 +397,19 @@ def generate_scene(
         raise ValueError("prompt must not be empty")
     if mode not in {"room", "house"}:
         raise ValueError("mode must be 'room' or 'house'")
+    _validate_stage(start_stage, "start_stage")
+    _validate_stage(stop_stage, "stop_stage")
+
+    start_idx = PIPELINE_STAGES.index(start_stage)
+    stop_idx = PIPELINE_STAGES.index(stop_stage)
+    if start_idx > stop_idx:
+        raise ValueError(
+            f"start_stage {start_stage!r} cannot come after stop_stage {stop_stage!r}"
+        )
+
+    resume_source = _resolve_resume_source(resume_from_path, resume_run_id)
+    if resume_source and start_stage == "floor_plan":
+        raise ValueError("Resuming requires start_stage after 'floor_plan'")
 
     _ensure_runtime_prereqs()
 
@@ -334,7 +431,11 @@ def generate_scene(
         f"experiment.csv_path={csv_path}",
         "experiment.num_workers=1",
         f"floor_plan_agent.mode={mode}",
+        f"experiment.pipeline.start_stage={start_stage}",
+        f"experiment.pipeline.stop_stage={stop_stage}",
     ]
+    if resume_source:
+        cmd.append(f"experiment.pipeline.resume_from_path={resume_source}")
     if extra_overrides.strip():
         cmd.extend(shlex.split(extra_overrides))
 
@@ -345,6 +446,9 @@ def generate_scene(
         "run_id": run_id,
         "output_dir": str(run_dir),
         "output_volume": OUTPUT_VOLUME_NAME,
+        "start_stage": start_stage,
+        "stop_stage": stop_stage,
+        "resume_from_path": resume_source,
     }
 
 
@@ -355,20 +459,28 @@ def main(
     prepare: bool = False,
     material_limit: int = 100,
     run_name: str = "",
+    start_stage: str = "floor_plan",
+    stop_stage: str = "manipuland",
+    resume_from_path: str = "",
+    resume_run_id: str = "",
     extra_overrides: str = "",
 ) -> None:
     """Optional convenience wrapper for local `modal run` usage."""
     if prepare:
-        result = prepare_data.remote(material_limit=material_limit)
+        result = prepare_data.spawn(material_limit=material_limit).get()
         print(result)
 
     if prompt:
-        result = generate_scene.remote(
+        result = generate_scene.spawn(
             prompt=prompt,
             mode=mode,
             run_name=run_name or None,
+            start_stage=start_stage,
+            stop_stage=stop_stage,
+            resume_from_path=resume_from_path,
+            resume_run_id=resume_run_id,
             extra_overrides=extra_overrides,
-        )
+        ).get()
         print(result)
         return
 
