@@ -9,6 +9,17 @@
 
 set -euo pipefail
 
+# During Docker builds uv installs into /app/.venv, but `python3` still points
+# at the system interpreter unless we select the venv explicitly.
+VENV_ROOT="${VIRTUAL_ENV:-/app/.venv}"
+PYTHON_BIN="${VENV_ROOT}/bin/python"
+if [ ! -x "${PYTHON_BIN}" ]; then
+    PYTHON_BIN="$(command -v python3)"
+else
+    export VIRTUAL_ENV="${VENV_ROOT}"
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+fi
+
 echo "========================================="
 echo "SAM3D Docker Installation"
 echo "========================================="
@@ -70,7 +81,7 @@ uv pip install --no-build-isolation \
 
 echo ""
 echo "Pre-compiling nvdiffrast CUDA extensions..."
-python3 << 'PYEOF'
+"${PYTHON_BIN}" << 'PYEOF'
 import sys
 import os
 
@@ -112,6 +123,9 @@ uv pip install --no-build-isolation \
 
 echo ""
 echo "Installing pytorch3d from source..."
+: "${PYTORCH3D_MAX_JOBS:=1}"
+MAX_JOBS="${MAX_JOBS:-${PYTORCH3D_MAX_JOBS}}" \
+CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-${PYTORCH3D_MAX_JOBS}}" \
 uv pip install --no-build-isolation \
     "git+https://github.com/facebookresearch/pytorch3d.git"
 
